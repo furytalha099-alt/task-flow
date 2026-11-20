@@ -1,4 +1,14 @@
 """TaskFlow secure multi-tenant API."""
+from app.schemas import NotificationResponse
+from sqlalchemy import or_, select, text
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from app.models import User, Company, Notification  # Make sure Notification is listed here!
+from app.schemas import MessageResponse, GoogleAuthRequest
+from fastapi import WebSocket, WebSocketDisconnect
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 import hashlib
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse
@@ -10,6 +20,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 from app.models import Group, GroupMembership
 from app.schemas import GroupCreate, GroupResponse
@@ -22,23 +33,27 @@ from jose import JWTError, jwt
 from redis import Redis
 from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-
+from sqlalchemy.orm import Session, joinedload
 load_dotenv()
-
+from dotenv import load_dotenv
+import ssl
+import traceback
+from app.ai_assistant import generate_task_ai_response
 from app.database import get_db
 from app.models import (
-    AuditEvent, AuthRefreshToken, AuthSession, Comment, Company, Project,
-    Task, TaskPriority, TaskStatus, User, UserRole,
+    AuditEvent, AuthRefreshToken, AuthSession, Comment, Company, Group,
+    GroupMembership, Notification, Project, Task, TaskPriority, TaskStatus,
+    User, UserRole,
 )
 from app.schemas import (
-    AuditEventResponse, CommentCreate, CommentResponse, CommentWithAuthorResponse, CompanyCreate,
-    CompanyLogin, CompanyPatch, CompanyResponse, CompanyUpdate, MessageResponse,
-    ProjectCreate, ProjectResponse, ProjectUpdate, TaskCreate, TaskResponse,
-    TaskStatusUpdate, TaskUpdate, UserCreate, UserLogin, UserResponse,
+    AuditEventResponse, CommentCreate, CommentResponse, CommentWithAuthorResponse,
+    CompanyCreate, CompanyLogin, CompanyPatch, CompanyResponse, CompanyUpdate,
+    GoogleAuthRequest, GroupCreate, GroupResponse, MessageResponse,
+    NotificationResponse, ProjectAIRequest, ProjectAIResponse, ProjectCreate,
+    ProjectResponse, ProjectUpdate, TaskAIRequest, TaskAIResponse, TaskCreate,
+    TaskResponse, TaskStatusUpdate, TaskUpdate, UserCreate, UserLogin,
+    UserResponse, UserSummary,
 )
-
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 PLATFORM_MASTER_KEY = os.getenv("PLATFORM_MASTER_KEY", "")
 ALGORITHM = "HS256"
@@ -77,6 +92,63 @@ _rate_lock = threading.Lock()
 _memory_buckets: dict[str, deque[float]] = defaultdict(deque)
 
 
+SMTP_SERVER = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SENDER_EMAIL = os.getenv("SMTP_USER", "muhammadtalha5037@gmail.com").strip()
+SENDER_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+
+
+def send_admin_email_alert(admin_email: str, subject: str, body: str):
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        print("Failed to send email alert: SMTP_USER or SMTP_PASSWORD is missing.")
+        return
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SENDER_EMAIL
+        msg["To"] = admin_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        context = ssl.create_default_context()
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context, timeout=20) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.sendmail(SENDER_EMAIL, admin_email, msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.sendmail(SENDER_EMAIL, admin_email, msg.as_string())
+    except Exception as e:
+        print(f"Failed to send email alert ({type(e).__name__}): {e!r}")
+        traceback.print_exc()
+
+class ConnectionManager:
+    def __init__(self):
+        # Maps company_id -> list of active admin WebSockets
+        self.active_connections: dict[int, list[WebSocket]] = defaultdict(list)
+
+    async def connect(self, company_id: int, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[company_id].append(websocket)
+
+    def disconnect(self, company_id: int, websocket: WebSocket):
+        conns = self.active_connections.get(company_id)
+        if conns and websocket in conns:
+            conns.remove(websocket)
+            if not conns:
+                del self.active_connections[company_id]
+
+    async def broadcast_to_company(self, company_id: int, message: dict):
+        if company_id in self.active_connections:
+            for connection in self.active_connections[company_id]:
+                await connection.send_json(message)
+
+manager = ConnectionManager()
+
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
     if ENVIRONMENT == "production" and redis_client is not None:
@@ -97,7 +169,7 @@ app = FastAPI(
 if ALLOWED_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
+        allow_origins=ALLOWED_ORIGINS,  # <--- Use the parsed list from .env, not a hardcoded string
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=[
@@ -470,11 +542,21 @@ def get_principal(
 
         refresh_row = None
         if refresh_session_id == auth_session.id:
+            # First check for unconsumed tokens
             refresh_row = db.query(AuthRefreshToken).filter(
                 AuthRefreshToken.session_id == auth_session.id,
                 AuthRefreshToken.token_hash == token_digest(refresh_cookie),
                 AuthRefreshToken.consumed_at.is_(None),
             ).first()
+
+            # Gracefully handle concurrent requests by allowing tokens consumed within the last 10 seconds
+            if refresh_row is None:
+                recent_cutoff = utc_now() - timedelta(seconds=10)
+                refresh_row = db.query(AuthRefreshToken).filter(
+                    AuthRefreshToken.session_id == auth_session.id,
+                    AuthRefreshToken.token_hash == token_digest(refresh_cookie),
+                    AuthRefreshToken.consumed_at >= recent_cutoff,
+                ).first()
 
         refresh_is_valid = (
             refresh_row is not None
@@ -541,7 +623,21 @@ def readiness(db: Session = Depends(get_db)) -> dict:
 def register_company(data: CompanyCreate, request: Request, db: Session = Depends(get_db)) -> Company:
     validate_origin(request)
     enforce_rate_limit(request, "company-signup", 5, 3600)
-    company = Company(name=data.name.strip(), subdomain=data.subdomain, admin_email=str(data.admin_email).lower(), admin_hashed_password=hash_password(data.admin_password))
+    
+    # 🔒 ENFORCE GMAIL/GOOGLE ONLY
+    admin_email = str(data.admin_email).strip().lower()
+    if not admin_email.endswith("@gmail.com"):
+        raise HTTPException(
+            status_code=400, 
+            detail="Registration is restricted to verified Google (@gmail.com) accounts only."
+        )
+
+    company = Company(
+        name=data.name.strip(), 
+        subdomain=data.subdomain, 
+        admin_email=admin_email, 
+        admin_hashed_password=hash_password(data.admin_password)
+    )
     db.add(company)
     db.flush()
     audit_event(db, company_id=company.id, actor_type="registrant", actor_id=None,
@@ -566,7 +662,7 @@ def login_company_admin(data: CompanyLogin, request: Request, response: Response
 
 
 @app.post("/users/login", response_model=MessageResponse)
-def login_user(data: UserLogin, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
+async def login_user(data: UserLogin, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
     validate_origin(request)
     enforce_login_limits(request, str(data.email))
     user = db.query(User).filter(User.email == str(data.email).lower()).first()
@@ -577,7 +673,44 @@ def login_user(data: UserLogin, request: Request, response: Response, db: Sessio
         raise HTTPException(status_code=403, detail="User account is deactivated.")
     create_session(response, db, subject_id=user.id, company_id=user.company_id, principal_type="user", role=user.role)
     audit_event(db, company_id=user.company_id, actor_type="user", actor_id=user.id, action="login", target_type="user", target_id=user.id)
+    
+    # 🔔 Notify Company Admin on User Login (Email + In-App)
+    # Notify Company Admin on User Login (Email + In-App)
+    company = db.query(Company).filter(Company.id == user.company_id).first()
+    if company and company.admin_email:
+        send_admin_email_alert(
+            admin_email=company.admin_email,
+            subject=f"User Login Alert: {user.email}",
+            body=f"User {user.email} has successfully logged into TaskFlow OS."
+        )
+
+        admin_notif = Notification(
+            recipient_id=company.id,
+            recipient_type="admin",
+            company_id=company.id,
+            title="User Login",
+            message=f"User {user.email} logged into the system."
+        )
+        db.add(admin_notif)
+
+    # Also log an in-app notification for the user who logged in
+    user_notif = Notification(
+        recipient_id=user.id,
+        recipient_type="user",
+        company_id=user.company_id,
+        title="Login Confirmed",
+        message="You signed in to TaskFlow OS."
+    )
+    db.add(user_notif)
+
     db.commit()
+
+    if company:
+        await manager.broadcast_to_company(
+            company.id,
+            {"type": "NOTIFICATION", "message": f"User {user.email} is now online."}
+        )
+
     return {"message": "User logged in successfully."}
 
 
@@ -718,6 +851,7 @@ def user_group_ids(db: Session, company_id: int, user_id: int):
 def visible_project_query(db: Session, company_id: int, actor):
     query = db.query(Project).filter(Project.company_id == company_id)
 
+    # Company admins bypass filters and see all projects
     if isinstance(actor, User):
         group_ids = user_group_ids(db, company_id, actor.id)
 
@@ -729,8 +863,8 @@ def visible_project_query(db: Session, company_id: int, actor):
 
         query = query.filter(
             or_(
-                Project.group_id.in_(group_ids),
-                Project.id.in_(assigned_project_ids),
+                Project.group_id.in_(select(group_ids.c.group_id)),
+                Project.id.in_(select(assigned_project_ids.c.project_id)),
             )
         )
 
@@ -738,28 +872,23 @@ def visible_project_query(db: Session, company_id: int, actor):
 
 
 def visible_task_query(db: Session, company_id: int, actor):
-    query = db.query(Task).outerjoin(
-        Project,
-        (Task.project_id == Project.id)
-        & (Task.company_id == Project.company_id),
+    query = db.query(Task).options(
+        joinedload(Task.assignee),
+        joinedload(Task.project)
     ).filter(Task.company_id == company_id)
 
+    # Only regular users are restricted to their own assigned tasks
     if isinstance(actor, User):
-        group_ids = user_group_ids(db, company_id, actor.id)
-        query = query.filter(
-            or_(
-                Project.group_id.in_(group_ids),
-                Task.assigned_to_id == actor.id,
-            )
-        )
-        return query  
+        query = query.filter(Task.assigned_to_id == actor.id)
+
+    return query
 @app.post("/projects/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
-def create_project(
+async def create_project(
     data: ProjectCreate,
     principal=Depends(require_company_admin),
     db: Session = Depends(get_db),
 ) -> Project:
-    _, company = principal
+    payload, company = principal
     validate_project_group(db, company.id, data.group_id)
 
     project = Project(
@@ -770,6 +899,23 @@ def create_project(
     )
     db.add(project)
     db.flush()
+
+    # 🔔 Notify all users belonging to the assigned group
+  # Notify all users belonging to the assigned group
+    if project.group_id:
+        group_members = db.query(GroupMembership).filter(
+            GroupMembership.company_id == company.id,
+            GroupMembership.group_id == project.group_id
+        ).all()
+        for member in group_members:
+            project_notification = Notification(
+                recipient_id=member.user_id,
+                recipient_type="user",
+                company_id=company.id,
+                title="Project Update",
+                message=f"You have been added to project: {project.name}."
+            )
+            db.add(project_notification)
 
     audit_event(
         db,
@@ -782,8 +928,23 @@ def create_project(
     )
     commit_or_conflict(db, "A project with this name already exists in your company.")
     db.refresh(project)
-    return project
 
+    # Send Admin Email Alert on Project Creation
+    if company.admin_email:
+        send_admin_email_alert(
+            admin_email=company.admin_email,
+            subject=f"TaskFlow OS: New Project Created - {project.name}",
+            body=f"A new project '{project.name}' was successfully created in your workspace."
+        )
+
+    # Broadcast live notification to company clients
+    await manager.broadcast_to_company(
+        company.id,
+        {"type": "NOTIFICATION", "message": f"New project created: {project.name}"}
+    )
+    
+
+    return project
 
 @app.get("/projects/", response_model=list[ProjectResponse])
 def list_projects(
@@ -959,71 +1120,6 @@ def delete_company_user(
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-@app.post(
-    "/tasks/",
-    response_model=TaskResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_task(
-    data: TaskCreate,
-    request: Request,
-    principal=Depends(require_company_admin),
-    db: Session = Depends(get_db),
-) -> Task:
-    payload, company = principal
-    enforce_rate_limit(request, "task-create", 120, 3600)
-
-    if data.project_id is not None:
-        project = db.query(Project).filter(
-            Project.id == data.project_id,
-            Project.company_id == payload["company_id"],
-        ).first()
-        if project is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Project not found in your company.",
-            )
-
-    if data.assigned_to_id is not None:
-        assignee = db.query(User).filter(
-            User.id == data.assigned_to_id,
-            User.company_id == payload["company_id"],
-            User.is_active.is_(True),
-        ).first()
-        if assignee is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Assigned user is not active in this company.",
-            )
-
-    task = Task(
-        title=data.title.strip(),
-        description=data.description,
-        status=data.status.value,
-        priority=data.priority.value,
-        due_at=data.due_at,
-        company_id=payload["company_id"],
-        project_id=data.project_id,
-        assigned_to_id=data.assigned_to_id,
-    )
-    db.add(task)
-    db.flush()
-
-    audit_event(
-        db,
-        company_id=company.id,
-        actor_type="company_admin",
-        actor_id=company.id,
-        action="task.create",
-        target_type="task",
-        target_id=task.id,
-    )
-
-    db.commit()
-    db.refresh(task)
-    return task
-
-
 @app.put("/tasks/{task_id}", response_model=TaskResponse)
 def edit_task(task_id: int, data: TaskUpdate, principal=Depends(require_company_admin), db: Session = Depends(get_db)) -> Task:
     payload, company = principal
@@ -1074,8 +1170,9 @@ def list_company_tasks(
     project_id: int | None = Query(default=None, gt=0),
     status_filter: TaskStatus | None = Query(default=None, alias="status"),
     priority_filter: TaskPriority | None = Query(default=None, alias="priority"),
-) -> list[Task]:
+) -> list[TaskResponse]:
     payload, actor = principal
+    
     query = visible_task_query(db, payload["company_id"], actor)
 
     if project_id is not None:
@@ -1085,10 +1182,76 @@ def list_company_tasks(
     if priority_filter is not None:
         query = query.filter(Task.priority == priority_filter.value)
 
-    return query.order_by(Task.id).offset(offset).limit(limit).all()
+    tasks = query.order_by(Task.id).offset(offset).limit(limit).all()
+
+    result = []
+    for task in tasks:
+        task_data = TaskResponse.model_validate(task)
+        # Map assignee details so the frontend inspector modal displays them properly
+        if task.assignee:
+            task_data.assignee_name = task.assignee.email
+            task_data.assigned_to_id = task.assignee.id
+        else:
+            task_data.assignee_name = "Unassigned"
+            task_data.assigned_to_id = None
+        result.append(task_data)
+
+    return result
+
+@app.get("/notifications/", response_model=list[NotificationResponse])
+def list_notifications(
+    principal=Depends(require_company_member),
+    db: Session = Depends(get_db),
+):
+    payload, actor = principal
+    query = db.query(Notification).filter(
+        Notification.company_id == payload["company_id"]
+    )
+    if isinstance(actor, User):
+        query = query.filter(
+            Notification.recipient_type == "user",
+            Notification.recipient_id == actor.id,
+        )
+    else:
+        query = query.filter(
+            Notification.recipient_type == "admin",
+            Notification.recipient_id == actor.id,
+        )
+    return query.order_by(Notification.id.desc()).all()
+
+
+@app.patch("/notifications/{notification_id}/read", response_model=NotificationResponse)
+def mark_notification_read(
+    notification_id: int,
+    principal=Depends(require_company_member),
+    db: Session = Depends(get_db),
+):
+    payload, actor = principal
+    query = db.query(Notification).filter(
+        Notification.id == notification_id,
+        Notification.company_id == payload["company_id"],
+    )
+    if isinstance(actor, User):
+        query = query.filter(
+            Notification.recipient_type == "user",
+            Notification.recipient_id == actor.id,
+        )
+    else:
+        query = query.filter(
+            Notification.recipient_type == "admin",
+            Notification.recipient_id == actor.id,
+        )
+    notif = query.first()
+    if notif is None:
+        raise HTTPException(status_code=404, detail="Notification not found.")
+
+    notif.is_read = True
+    db.commit()
+    db.refresh(notif)
+    return notif
 
 @app.patch("/tasks/{task_id}/status", response_model=TaskResponse)
-def update_task_status(task_id: int, data: TaskStatusUpdate, principal=Depends(require_company_member), db: Session = Depends(get_db)) -> Task:
+async def update_task_status(task_id: int, data: TaskStatusUpdate, principal=Depends(require_company_member), db: Session = Depends(get_db)) -> Task:
     payload, actor = principal
     task = db.query(Task).filter(Task.id == task_id, Task.company_id == payload["company_id"]).first()
     if task is None:
@@ -1109,6 +1272,24 @@ def update_task_status(task_id: int, data: TaskStatusUpdate, principal=Depends(r
                     details={"old_status": old_status, "new_status": task.status})
     db.commit()
     db.refresh(task)
+
+    # 🔔 Notify admin when status is changed by a user
+    if isinstance(actor, User):
+        status_notification = Notification(
+            recipient_id=task.company_id,
+            recipient_type="admin",
+            company_id=task.company_id,
+            title="Task Status Updated",
+            message=f"User updated task '{task.title}' status from {old_status} to {task.status}."
+        )
+        db.add(status_notification)
+        db.commit()
+
+        await manager.broadcast_to_company(
+            task.company_id,
+            {"type": "NOTIFICATION", "message": f"Task '{task.title}' status updated to {task.status}"}
+        )
+
     return task
 
 
@@ -1123,6 +1304,87 @@ def delete_task(task_id: int, principal=Depends(require_company_admin), db: Sess
     db.delete(task)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+@app.post(
+    "/tasks/{task_id}/comments/",
+    response_model=CommentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_task_comment(
+    task_id: int,
+    data: CommentCreate,
+    principal=Depends(require_company_member),
+    db: Session = Depends(get_db),
+):
+    payload, actor = principal
+    company_id = payload["company_id"]
+
+    task = db.query(Task).filter(
+        Task.id == task_id,
+        Task.company_id == company_id,
+    ).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    if not isinstance(actor, User):
+        raise HTTPException(
+            status_code=403,
+            detail="Only assigned team members can post task comments here.",
+        )
+
+    if task.assigned_to_id != actor.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only comment on tasks assigned to you.",
+        )
+
+    cleaned = data.content.strip()
+    if not cleaned:
+        raise HTTPException(status_code=422, detail="Comment cannot be empty.")
+
+    try:
+        comment = Comment(
+            company_id=company_id,
+            task_id=task.id,
+            user_id=actor.id,
+            content=cleaned,
+        )
+        db.add(comment)
+        db.flush()
+
+        notif = Notification(
+            recipient_id=company_id,
+            recipient_type="admin",
+            company_id=company_id,
+            task_id=task.id,
+            comment_id=comment.id,
+            title=f"New Comment on '{task.title}'",
+            message=f"{actor.email} commented on '{task.title}': {cleaned[:120]}",
+            is_read=False,
+        )
+        db.add(notif)
+        db.commit()
+        db.refresh(comment)
+        db.refresh(notif)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to save comment and notification.")
+
+    await manager.broadcast_to_company(
+        company_id,
+        {
+            "type": "NOTIFICATION",
+            "notification_id": notif.id,
+            "task_id": task.id,
+            "comment_id": comment.id,
+            "title": notif.title,
+            "message": notif.message,
+        },
+    )
+    return comment
 
 
 @app.get(
@@ -1160,73 +1422,15 @@ def list_task_comments(
     return [
         {
             "id": comment.id,
+            "company_id": comment.company_id,
             "content": comment.content,
             "task_id": comment.task_id,
             "user_id": comment.user_id,
             "author_email": email,
+            "created_at": comment.created_at,
         }
         for comment, email in rows
     ]
-
-
-@app.post(
-    "/tasks/{task_id}/comments/",
-    response_model=CommentResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def add_comment(
-    task_id: int,
-    data: CommentCreate,
-    request: Request,
-    principal=Depends(require_company_member),
-    db: Session = Depends(get_db),
-) -> Comment:
-    payload, actor = principal
-    enforce_rate_limit(request, "comment-create", 60, 3600)
-
-    if not isinstance(actor, User):
-        raise HTTPException(
-            status_code=403,
-            detail="A user account is required to comment.",
-        )
-
-    task = visible_task_query(
-        db,
-        payload["company_id"],
-        actor,
-    ).filter(Task.id == task_id).first()
-
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found.")
-
-    if task.assigned_to_id != actor.id:
-        raise HTTPException(
-            status_code=403,
-            detail="Members can comment only on tasks assigned to them.",
-        )
-
-    comment = Comment(
-        content=data.content.strip(),
-        task_id=task.id,
-        user_id=actor.id,
-    )
-    db.add(comment)
-    db.flush()
-
-    audit_event(
-        db,
-        company_id=payload["company_id"],
-        actor_type="user",
-        actor_id=actor.id,
-        action="comment.create",
-        target_type="comment",
-        target_id=comment.id,
-        details={"task_id": task.id},
-    )
-
-    db.commit()
-    db.refresh(comment)
-    return comment
 
 
 @app.get("/admin/audit", response_model=list[AuditEventResponse])
@@ -1295,7 +1499,7 @@ def super_admin_delete_company(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @app.post("/groups/", response_model=GroupResponse, status_code=201)
-def create_group(
+async def create_group(
     data: GroupCreate,
     principal=Depends(require_company_admin),
     db: Session = Depends(get_db),
@@ -1322,6 +1526,23 @@ def create_group(
 
     commit_or_conflict(db, "A group with this name already exists in your company.")
     db.refresh(group)
+
+    # 🔔 Persistent In-App Database Notification for Group Creation
+    group_notification = Notification(
+        recipient_id=company.id,
+        recipient_type="admin",
+        company_id=company.id,
+        title="Group Created",
+        message=f"New group created: {group.name}."
+    )
+    db.add(group_notification)
+    db.commit()
+
+    await manager.broadcast_to_company(
+        company.id,
+        {"type": "NOTIFICATION", "message": f"New group created: {group.name}"}
+    )
+
     return group
 
 
@@ -1331,19 +1552,16 @@ def list_groups(
     db: Session = Depends(get_db),
 ):
     payload, actor = principal
+    company_id = payload["company_id"]
 
-    query = db.query(Group).filter(
-        Group.company_id == payload["company_id"]
-    )
+    query = db.query(Group).options(joinedload(Group.users)).filter(Group.company_id == company_id)
 
+    # Regular users see only groups they are members of
     if isinstance(actor, User):
-        query = query.join(GroupMembership).filter(
-            GroupMembership.company_id == payload["company_id"],
-            GroupMembership.user_id == actor.id,
-        )
+        user_group_ids_subquery = user_group_ids(db, company_id, actor.id)
+        query = query.filter(Group.id.in_(select(user_group_ids_subquery.c.group_id)))
 
     return query.order_by(Group.name).all()
-
 
 @app.post("/groups/{group_id}/members/{user_id}", status_code=204)
 def add_group_member(
@@ -1397,3 +1615,370 @@ def add_group_member(
         commit_or_conflict(db, "That user is already in the group.")
 
     return Response(status_code=204)
+
+@app.delete("/groups/{group_id}/members/{user_id}", status_code=204)
+def remove_user_from_group(
+    group_id: int,
+    user_id: int,
+    principal=Depends(require_company_admin), # Automatically enforces admin privileges safely
+    db: Session = Depends(get_db),
+):
+    payload, company = principal
+    company_id = payload["company_id"]
+    
+    # 1. Verify group belongs to tenant
+    group = db.query(Group).filter(
+        Group.id == group_id, 
+        Group.company_id == company_id
+    ).first()
+    
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found.")
+    
+    # 2. Delete association record using GroupMembership model
+    membership = db.query(GroupMembership).filter(
+        GroupMembership.company_id == company_id,
+        GroupMembership.group_id == group_id,
+        GroupMembership.user_id == user_id
+    ).first()
+    
+    if membership:
+        db.delete(membership)
+        audit_event(
+            db,
+            company_id=company_id,
+            actor_type="company_admin",
+            actor_id=company.id,
+            action="group.member.remove",
+            target_type="group_membership",
+            target_id=f"{group_id}:{user_id}",
+        )
+        db.commit()
+        
+    return Response(status_code=204)
+
+@app.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_group(
+    group_id: int,
+    principal=Depends(require_company_admin),
+    db: Session = Depends(get_db),
+) -> Response:
+    payload, company = principal
+    company_id = payload["company_id"]
+
+    # Verify the group belongs to the company before deleting
+    group = db.query(Group).filter(
+        Group.id == group_id,
+        Group.company_id == company_id,
+    ).first()
+
+    if group is None:
+        raise HTTPException(status_code=404, detail="Group not found.")
+
+    audit_event(
+        db,
+        company_id=company.id,
+        actor_type="company_admin",
+        actor_id=company.id,
+        action="group.delete",
+        target_type="group",
+        target_id=group.id,
+    )
+    
+    db.delete(group)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+
+@app.post("/auth/google", response_model=MessageResponse)
+def google_auth_login(data: GoogleAuthRequest, request: Request, response: Response, db: Session = Depends(get_db)):
+    token = data.credential.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Google credential missing.")
+
+    try:
+        # Verify the Google ID token securely
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Google token.")
+
+    if not idinfo.get("email_verified"):
+        raise HTTPException(status_code=403, detail="Google email must be verified.")
+
+    email = (idinfo.get("email") or "").strip().lower()
+    local_part, sep, domain = email.partition("@")
+    if not sep or not local_part or domain != "gmail.com":
+        raise HTTPException(status_code=403, detail="Only @gmail.com Google accounts are allowed.")
+
+    # 1. Check if regular user exists in the database
+    user = db.query(User).filter(User.email == email).first()
+    if user is not None:
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="User account is deactivated.")
+
+        # Create standard TaskFlow session for user
+        create_session(response, db, subject_id=user.id, company_id=user.company_id, principal_type="user", role=user.role)
+        db.commit()
+        return {"message": "Google authentication successful."}
+
+    # 2. Check if company admin exists in the Company table
+    company = db.query(Company).filter(Company.admin_email == email).first()
+    if company is not None:
+        # Create session for company admin
+        create_session(response, db, subject_id=company.id, company_id=company.id, principal_type="company_admin", role="admin")
+        db.commit()
+        return {"message": "Google authentication successful."}
+
+    # If neither user nor company admin is found
+    raise HTTPException(status_code=404, detail="No company account associated with this Google email.")
+
+
+@app.websocket("/ws/notifications/{company_id}")
+async def websocket_endpoint(websocket: WebSocket, company_id: int):
+    await manager.connect(company_id, websocket)
+    try:
+        while True:
+            # Keep connection alive and listen for any client pings
+            data = await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(company_id, websocket)
+
+
+@app.post(
+    "/tasks/",
+    response_model=TaskResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_task(
+    data: TaskCreate,
+    request: Request,
+    principal=Depends(require_company_admin),
+    db: Session = Depends(get_db),
+) -> Task:
+    payload, company = principal
+    enforce_rate_limit(request, "task-create", 120, 3600)
+
+    if data.project_id is not None:
+        project = db.query(Project).filter(
+            Project.id == data.project_id,
+            Project.company_id == company.id,
+        ).first()
+        if project is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Project not found in your company.",
+            )
+
+    assignee = None
+    if data.assigned_to_id is not None:
+        assignee = db.query(User).filter(
+            User.id == data.assigned_to_id,
+            User.company_id == company.id,
+            User.is_active.is_(True),
+        ).first()
+        if assignee is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Assigned user is not active in this company.",
+            )
+
+    task = Task(
+        title=data.title.strip(),
+        description=data.description.strip() if data.description else None,
+        status=data.status.value,
+        priority=data.priority.value,
+        due_at=data.due_at,
+        assigned_to_id=data.assigned_to_id,
+        project_id=data.project_id,
+        company_id=company.id,
+    )
+    db.add(task)
+    db.flush()
+
+    audit_event(
+        db,
+        company_id=company.id,
+        actor_type="company_admin",
+        actor_id=company.id,
+        action="task.create",
+        target_type="task",
+        target_id=task.id,
+    )
+
+    if assignee is not None:
+        assignment_notification = Notification(
+            recipient_id=assignee.id,
+            recipient_type="user",
+            company_id=company.id,
+            title="New Assignment",
+            message=f"You have been assigned to: {task.title}.",
+        )
+        db.add(assignment_notification)
+
+        if assignee.email:
+            send_admin_email_alert(
+                admin_email=assignee.email,
+                subject=f"TaskFlow OS: New Task Assigned - {task.title}",
+                body=f"You have been assigned task '{task.title}' (Priority: {task.priority}).",
+            )
+
+    if company and company.admin_email:
+        send_admin_email_alert(
+            admin_email=company.admin_email,
+            subject=f"TaskFlow OS: New Task Dispatched - {task.title}",
+            body=(
+                f"Task '{task.title}' (Priority: {task.priority}) has been created in company ID {company.id}."
+                + (f" Assigned to: {assignee.email}." if assignee else " Assigned to: Unassigned.")
+            ),
+        )
+
+    db.commit()
+    db.refresh(task)
+
+    await manager.broadcast_to_company(
+        company.id,
+        {"type": "NOTIFICATION", "message": f"New task dispatched: {task.title}"},
+    )
+    return task
+
+
+@app.post("/tasks/{task_id}/ai", response_model=TaskAIResponse)
+def run_task_ai(
+    task_id: int,
+    data: TaskAIRequest,
+    request: Request,
+    principal=Depends(require_company_member),
+    db: Session = Depends(get_db),
+):
+    payload, actor = principal
+    company_id = payload["company_id"]
+    enforce_rate_limit(request, "task-ai", 30, 60)
+
+    task = db.query(Task).filter(
+        Task.id == task_id,
+        Task.company_id == company_id,
+    ).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    if isinstance(actor, User) and task.assigned_to_id != actor.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only use AI assistance on tasks assigned to you.",
+        )
+
+    try:
+        answer, model_used = generate_task_ai_response(
+            db=db,
+            task=task,
+            mode=data.mode,
+            question=data.question,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        import traceback
+        print("AI error:", type(exc).__name__, exc)
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail="AI service temporarily unavailable.")
+
+    return {
+        "task_id": task.id,
+        "mode": data.mode,
+        "model": model_used,
+        "response": answer,
+    }
+
+
+@app.post("/projects/{project_id}/ai", response_model=ProjectAIResponse)
+def run_project_ai(
+    project_id: int,
+    data: ProjectAIRequest,
+    request: Request,
+    principal=Depends(require_company_member),
+    db: Session = Depends(get_db),
+):
+    payload, actor = principal
+    company_id = payload["company_id"]
+    enforce_rate_limit(request, "project-ai", 30, 60)
+
+    project = (
+        visible_project_query(db, company_id, actor)
+        .filter(Project.id == project_id)
+        .first()
+    )
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    question_text = (data.question or "").strip()
+    if data.mode == "ask" and not question_text:
+        raise HTTPException(status_code=422, detail="Question is required.")
+
+    project_tasks = (
+        db.query(Task)
+        .filter(
+            Task.company_id == company_id,
+            Task.project_id == project.id,
+        )
+        .order_by(Task.id)
+        .limit(50)
+        .all()
+    )
+
+    task_lines = [
+        f"- [#{t.id}] {t.title} (status={t.status}, priority={t.priority}): {t.description or 'No description'}"
+        for t in project_tasks
+    ]
+    scoped_context = (
+        f"Project ID: {project.id}\n"
+        f"Project Name: {project.name}\n"
+        f"Project Description: {project.description or 'No description provided.'}\n"
+        f"Project Tasks ({len(project_tasks)}):\n"
+        + ("\n".join(task_lines) if task_lines else "No tasks in this project.")
+    )
+
+    scoped_task_proxy = SimpleNamespace(
+        id=project.id,
+        title=f"Project: {project.name}",
+        description=scoped_context,
+        status="in_progress",
+        priority="normal",
+        company_id=company_id,
+        project_id=project.id,
+        assigned_to_id=None,
+    )
+
+    prompt_instruction = (
+        f"{question_text}\n\n"
+        "Respond directly to the user's request above (such as a step-by-step breakdown, plan, status check, or explanation) "
+        "grounded strictly in the project details and tasks in the context. Do not just summarize unless asked."
+        if data.mode == "ask"
+        else "Provide a concise summary of this project and its tasks strictly from the context provided."
+    )
+
+    try:
+        answer, model_used = generate_task_ai_response(
+            db=db,
+            task=scoped_task_proxy,
+            mode="ask",
+            question=prompt_instruction,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        import traceback
+        print("Project AI error:", type(exc).__name__, exc)
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail="AI service temporarily unavailable.")
+
+    return {
+        "project_id": project.id,
+        "mode": data.mode,
+        "model": model_used,
+        "response": answer,
+    }

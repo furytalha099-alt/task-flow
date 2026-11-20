@@ -1,15 +1,11 @@
 """TaskFlow database models."""
+
 import enum
-from sqlalchemy import UniqueConstraint, ForeignKeyConstraint
+from sqlalchemy import UniqueConstraint,Column
 from datetime import datetime, timezone
-
-from sqlalchemy import Boolean, DateTime, ForeignKey, ForeignKeyConstraint, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, ForeignKeyConstraint, Integer, JSON, String, Text, UniqueConstraint,CheckConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from app.database import Base
-
 
 class UserRole(str, enum.Enum):
     admin = "admin"
@@ -31,6 +27,9 @@ class TaskPriority(str, enum.Enum):
 
 class Company(Base):
     __tablename__ = "companies"
+    __table_args__ = (
+        CheckConstraint("lower(admin_email) LIKE '%@gmail.com'", name="ck_companies_admin_email_gmail"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True, index=True)
@@ -45,8 +44,10 @@ class Company(Base):
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (UniqueConstraint("id", "company_id", name="uq_user_id_company"),)
-
+    __table_args__ = (
+        UniqueConstraint("id", "company_id", name="uq_user_id_company"),
+        CheckConstraint("lower(email) LIKE '%@gmail.com'", name="ck_users_email_gmail"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     # Login identifies users by email, so email must be globally unique.
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
@@ -127,9 +128,15 @@ class Comment(Base):
     __tablename__ = "comments"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    company_id: Mapped[int] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
 
     task: Mapped["Task"] = relationship(back_populates="comments")
     user: Mapped["User"] = relationship(back_populates="comments")
@@ -196,6 +203,14 @@ class Group(Base):
         back_populates="group",
         cascade="all, delete-orphan",
     )
+    
+    # ADD THIS RELATIONSHIP FOR MEMBER POPULATION:
+    users: Mapped[list["User"]] = relationship(
+        secondary="group_memberships",
+        primaryjoin="Group.id == GroupMembership.group_id",
+        secondaryjoin="User.id == GroupMembership.user_id",
+        viewonly=True,
+    )
 
 
 class GroupMembership(Base):
@@ -221,3 +236,22 @@ class GroupMembership(Base):
     )
 
     group: Mapped["Group"] = relationship(back_populates="memberships")
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    recipient_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    recipient_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    comment_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )   
