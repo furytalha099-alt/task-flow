@@ -1,63 +1,60 @@
-# TaskFlow Backend
+# TaskFlow OS
 
-TaskFlow is a multi-tenant project and task management API. Each company manages its own users, groups, projects, and tasks, with access controlled by company and role.
+**TaskFlow OS** is a multi-tenant task, project, group, and workflow management backend built with **FastAPI**, **SQLAlchemy 2.0**, **PostgreSQL (Neon)**, **Redis**, and **Pydantic v2**, paired with a **React + TypeScript + Vite** frontend (`frontend/`) and an automated **`pytest` + GitHub Actions** CI/CD pipeline.
 
-## Features
+It is structured around tenant-scoped data isolation, authenticated sessions/JWT workflows, relational schema evolution with Alembic, real-time WebSocket updates, rate-limiting controls, and AI-assisted task/project workflows (`app/ai_assistant.py`).
 
-- Company registration and company-admin authentication
-- Company user registration and management
-- Groups, memberships, and group-based project visibility
-- Project and task creation and management
-- Task assignment to active users in the same company
-- Task status updates and comments
-- JWT access and refresh sessions, logout, and bcrypt password hashing
-- Company-scoped and role-based authorization
-- Audit event records
-- PostgreSQL persistence with Neon
+---
 
-## Technology
+## Key Capabilities & Architecture
 
-- Python
-- FastAPI
-- SQLAlchemy
-- Pydantic
-- PostgreSQL, Neon, and Psycopg
-- Alembic migrations
-- OpenAPI and Swagger UI
+- **Multi-Tenant Backend Architecture:** Tenant-aware domain modeling and request scoping so organizations, users, groups, projects, tasks, comments, and notifications stay isolated per tenant.
+- **Authentication & Access Control:** Token/session authentication, credential/key handling (`SECRET_KEY`, `PLATFORM_MASTER_KEY`), and protected endpoints across core resources.
+- **Relational Persistence & Migrations:** SQLAlchemy 2.0 ORM models (`app/models.py`) and Pydantic v2 schemas (`app/schemas.py`) paired with versioned Alembic migrations (`migrations/versions/`) targeting PostgreSQL / Neon in production and SQLite in isolated test/CI runs.
+- **Caching, Rate Limiting & Real-Time Updates:** Redis integration (`REDIS_URL`) for caching/coordination, rate-limit controls, and WebSocket connection management for live updates.
+- **AI Assistant & Summarization:** Dedicated assistant module (`app/ai_assistant.py`) and frontend cards (`TaskAISummaryCard.tsx`, `ProjectAIAskCard.tsx`) for task and project assistance.
+- **Frontend Workspace:** React + TypeScript + Vite application (`frontend/`) covering dashboard views, command center, projects, tasks, groups, users, tenant settings, and user guide.
+- **Automated Testing & CI/CD:** `pytest` suite (`tests/conftest.py`, `tests/test_api.py`) using isolated fixtures (including `DummyConnectionManager` and `_reset_rate_limits`), wired to GitHub Actions (`.github/workflows/ci.yml`) and containerized with a `Dockerfile`.
 
-## Access model
+---
 
-- Company admins manage their company’s users, groups, projects, and tasks.
-- Members can see projects and tasks available to their group.
-- Members can update status and comment only on tasks assigned to them.
-- Company data is scoped to the authenticated user’s company.
+## Tech Stack
 
-## Run locally
+| Layer | Technologies |
+| :--- | :--- |
+| **API & Backend** | Python, FastAPI, Uvicorn, Pydantic v2 |
+| **Database & Migrations** | SQLAlchemy 2.0, PostgreSQL (Neon), Alembic, SQLite (test/CI) |
+| **Caching & Real-Time** | Redis, WebSockets |
+| **Frontend** | React, TypeScript, Vite |
+| **Testing, Containerization & CI** | `pytest`, Docker (`python:3.13-slim`), GitHub Actions |
 
-Requirements: Python and a PostgreSQL database.
+---
 
-1. Create and activate a virtual environment.
-2. Install dependencies with `pip install -r requirements.txt`.
-3. Copy `.env.example` to `.env` and enter your local configuration.
-4. Apply database migrations with `alembic upgrade head`.
-5. Start the API from the project root:
+## Project Structure
 
-   `python -m uvicorn app.main:app --reload`
-
-6. Open `http://127.0.0.1:8000/docs` for the interactive API documentation when Swagger is enabled.
-
-Keep `.env` private. Use environment variables or your hosting provider’s secret manager for database credentials and signing keys.
-
-## Database
-
-Alembic manages schema migrations. Neon PostgreSQL stores the application data, including companies, users, groups, projects, tasks, comments, authentication sessions, refresh tokens, and audit events.
-
-## Manual verification
-
-Manually checked through the API:
-
-- Company and member login
-- Company and group visibility boundaries
-- Task assignment and member status/comment permissions
-- Refresh-session behavior
-- Database records saved in Neon
+```text
+task flow/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                  # GitHub Actions CI workflow (pytest + Docker build check)
+├── app/
+│   ├── ai_assistant.py             # AI assistant & summarization logic
+│   ├── main.py                     # FastAPI application, routes, middleware, WebSockets
+│   ├── models.py                   # SQLAlchemy 2.0 ORM models
+│   └── schemas.py                  # Pydantic v2 request/response schemas
+├── frontend/
+│   ├── src/
+│   │   ├── components/             # Dashboard, CommandCenter, Projects, Tasks, Groups, Users, Settings
+│   │   ├── App.tsx                 # Main frontend application shell
+│   │   └── main.tsx                # Frontend entry point
+│   ├── package.json                # Frontend dependencies & scripts
+│   └── vite.config.ts              # Vite configuration
+├── migrations/
+│   └── versions/                   # Alembic migration revisions
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py                 # Test fixtures, DB setup, connection & rate-limit helpers
+│   └── test_api.py                 # End-to-end API, auth, multi-tenancy & workflow tests
+├── Dockerfile                      # Production-ready container image definition
+├── requirements.txt                # Backend Python dependencies
+└── README.md

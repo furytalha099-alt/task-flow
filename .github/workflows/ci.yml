@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  test-and-build:
     runs-on: ubuntu-latest
 
     env:
@@ -33,3 +33,6 @@ jobs:
 
       - name: Run pytest test suite
         run: python -m pytest -v
+
+      - name: Verify Docker image builds
+        run: docker build -t taskflow-api:ci .
