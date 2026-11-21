@@ -1982,3 +1982,13 @@ def run_project_ai(
         "model": model_used,
         "response": answer,
     }
+
+@app.get("/")
+def root():
+    return {
+        "service": "TaskFlow API",
+        "version": "2.0.0",
+        "status": "ok",
+        "openapi": "/openapi.json",
+        "health": "/health",
+    }
