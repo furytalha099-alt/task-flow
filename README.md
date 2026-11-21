@@ -58,3 +58,6 @@ task flow/
 ├── Dockerfile                      # Production-ready container image definition
 ├── requirements.txt                # Backend Python dependencies
 └── README.md
+## Live Deployment
+- API Base URL: https://task-flow1234.vercel.app
+- OpenAPI Schema: https://task-flow1234.vercel.app/openapi.json
