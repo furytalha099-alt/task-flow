@@ -1,8 +1,21 @@
-import React, { useState } from "react";
+import { useState } from "react";
 
 function getCsrfToken() {
   const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
   return match ? decodeURIComponent(match[1]) : "";
+}
+
+interface ProjectAIAskProject {
+  id: number | string;
+  name?: string;
+  title?: string;
+}
+
+interface ProjectAIAskCardProps {
+  project: ProjectAIAskProject;
+  currentUserId?: number | null;
+  userRole?: string;
+  apiBaseUrl: string;
 }
 
 export function ProjectAIAskCard({
@@ -10,7 +23,7 @@ export function ProjectAIAskCard({
   currentUserId = null,
   userRole = "member",
   apiBaseUrl = "",
-}) {
+}: ProjectAIAskCardProps) {
   const [isAskOpen, setIsAskOpen] = useState(true);
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
@@ -22,7 +35,7 @@ export function ProjectAIAskCard({
     return null;
   }
 
-  async function handleAskQuestion(e) {
+  async function handleAskQuestion(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const trimmed = question.trim();
     if (!trimmed || loading) {
@@ -33,8 +46,8 @@ export function ProjectAIAskCard({
     setError("");
 
     try {
-      const csrfToken = getCsrfToken();
-      const headers = {
+     const csrfToken = getCsrfToken();
+      const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
       if (csrfToken) {
@@ -61,9 +74,9 @@ export function ProjectAIAskCard({
 
       setAnswer(payload.response || "");
       setModel(payload.model || "");
-    } catch (err) {
-      setError(err.message || "Unable to answer project question.");
-    } finally {
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Unable to answer project question.");
+    }finally {
       setLoading(false);
     }
   }

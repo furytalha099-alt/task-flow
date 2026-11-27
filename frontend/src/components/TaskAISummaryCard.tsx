@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import { useState } from "react";
 
 function getCsrfToken() {
   const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
@@ -9,9 +9,10 @@ interface TaskAISummaryCardProps {
   task: {
     id: number | string;
     title?: string;
-    description?: string;
+    description?: string | null;
     status?: string;
     priority?: string;
+    assigned_to_id?: number | string | null;
   } | null;
   currentUserId?: number | string | null;
   userRole?: string;
@@ -52,8 +53,12 @@ console.log("AI visibility check:", {
     setError("");
 
     try {
+      if (!task) {
+        throw new Error("Task is missing.");
+      }
+
       const csrfToken = getCsrfToken();
-      const headers = {
+      const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
       if (csrfToken) {
@@ -74,8 +79,8 @@ console.log("AI visibility check:", {
 
       setSummary(payload.response || "");
       setModel(payload.model || "");
-    } catch (err) {
-      setError(err.message || "Unable to summarize task.");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Unable to summarize task.");
     } finally {
       setLoading(false);
     }

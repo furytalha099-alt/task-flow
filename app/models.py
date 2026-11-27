@@ -104,6 +104,7 @@ class Project(Base):
 class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
+        UniqueConstraint("id", "company_id", name="uq_task_id_company"),
         ForeignKeyConstraint(["project_id", "company_id"], ["projects.id", "projects.company_id"], name="fk_task_project_same_company", ondelete="CASCADE"),
         ForeignKeyConstraint(["assigned_to_id", "company_id"], ["users.id", "users.company_id"], name="fk_task_assignee_same_company"),
     )
@@ -126,18 +127,35 @@ class Task(Base):
 
 class Comment(Base):
     __tablename__ = "comments"
+    __table_args__ = (
+        UniqueConstraint("id", "company_id", name="uq_comment_id_company"),
+        ForeignKeyConstraint(
+            ["task_id", "company_id"],
+            ["tasks.id", "tasks.company_id"],
+            name="fk_comment_task_same_company",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["user_id", "company_id"],
+            ["users.id", "users.company_id"],
+            name="fk_comment_user_same_company",
+            ondelete="CASCADE",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     company_id: Mapped[int] = mapped_column(
         ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
+    task: Mapped["Task"] = relationship(back_populates="comments")
+    user: Mapped["User"] = relationship(back_populates="comments")
     task: Mapped["Task"] = relationship(back_populates="comments")
     user: Mapped["User"] = relationship(back_populates="comments")
 
@@ -240,6 +258,20 @@ class GroupMembership(Base):
 
 class Notification(Base):
     __tablename__ = "notifications"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["task_id", "company_id"],
+            ["tasks.id", "tasks.company_id"],
+            name="fk_notification_task_same_company",
+            ondelete="SET NULL",
+        ),
+        ForeignKeyConstraint(
+            ["comment_id", "company_id"],
+            ["comments.id", "comments.company_id"],
+            name="fk_notification_comment_same_company",
+            ondelete="SET NULL",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     recipient_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)

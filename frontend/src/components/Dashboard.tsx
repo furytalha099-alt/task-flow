@@ -7,8 +7,59 @@ import TenantSettings from './TenantSettings'
 import UsersView from './UsersView'
 import UserGuide from './UserGuide'
 
+interface CompanyInfo {
+  id?: number
+  company_id?: number
+  name?: string
+}
+
+interface WorkspaceProject {
+  id: number
+  name: string
+  description?: string | null
+  company_id: number
+  group_id?: number | null
+}
+
+interface WorkspaceTask {
+  id: number
+  title: string
+  description?: string | null
+  status: string
+  priority: string
+  due_at?: string | null
+  company_id: number
+  project_id?: number | null
+  assigned_to_id?: number | null
+  assignee_name?: string | null
+}
+
+interface WorkspaceUser {
+  id: number
+  email: string
+  role: string
+  is_active: boolean
+  company_id: number
+}
+
+interface WorkspaceGroup {
+  id: number
+  name: string
+  description?: string | null
+  company_id: number
+  users?: WorkspaceUser[]
+}
+
+interface WorkspaceNotification {
+  id: number | string
+  title?: string
+  message?: string
+  is_read?: boolean
+  created_at?: string
+}
+
 interface DashboardProps {
-  companyData: any
+  companyData: CompanyInfo | null
   userRole: 'admin' | 'member'
   currentUserId?: number | null
   apiUrl?: string
@@ -25,16 +76,15 @@ export default function Dashboard({
   const [activeTab, setActiveTab] = useState<'overview' | 'groups' | 'projects' | 'tasks' | 'settings' | 'users' | 'guide'>('overview')
   
   // Shared Data States
-  const [projects, setProjects] = useState<any[]>([])
-  const [tasks, setTasks] = useState<any[]>([])
-  const [users, setUsers] = useState<any[]>([])
-  const [groups, setGroups] = useState<any[]>([])
-  const [notifications, setNotifications] = useState<any[]>([])
+  const [projects, setProjects] = useState<WorkspaceProject[]>([])
+  const [tasks, setTasks] = useState<WorkspaceTask[]>([])
+  const [users, setUsers] = useState<WorkspaceUser[]>([])
+  const [groups, setGroups] = useState<WorkspaceGroup[]>([])
+  const [notifications, setNotifications] = useState<WorkspaceNotification[]>([])
   const [loading, setLoading] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
   const [showNotifications, setShowNotifications] = useState(false)
-  const companyId = companyData?.id ?? companyData?.company_id
 
   function getCsrfToken(): string {
     const match = document.cookie.match(/(?:^|; )csrf_token=([^;]*)/)
@@ -78,34 +128,65 @@ export default function Dashboard({
     loadWorkspaceData()
   }, [loadWorkspaceData])
 
-  // 🔔 Live WebSocket Notification Listener
+  // Live WebSocket Notification Listener (tenant comes from backend auth session)
   useEffect(() => {
-    if (!companyId) return
+    let socket: WebSocket | null = null
+    let reconnectTimer: number | null = null
+    let disposed = false
+    let attempt = 0
 
-    const wsUrl = apiUrl.replace(/^http/, 'ws') + `/ws/notifications/${companyId}`
-    const socket = new WebSocket(wsUrl)
+    const connectSocket = () => {
+      if (disposed) return
+      const wsUrl = apiUrl.replace(/^http/, 'ws') + '/ws/notifications'
+      socket = new WebSocket(wsUrl)
 
-    socket.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data)
-        if (payload?.type === 'NOTIFICATION' && payload?.message) {
-          setSuccessMsg(payload.message)
-          setNotifications((prev) => [
-            { id: Date.now(), title: payload.title || 'Live Alert', message: payload.message, created_at: new Date().toISOString() },
-            ...prev,
-          ])
+      socket.onopen = () => {
+        attempt = 0
+      }
+
+      socket.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data)
+          if (payload?.type === 'NOTIFICATION' && payload?.message) {
+            setSuccessMsg(payload.message)
+            setNotifications((prev) => [
+              {
+                id: payload.notification_id ?? Date.now(),
+                title: payload.title || 'Live Alert',
+                message: payload.message,
+                created_at: new Date().toISOString(),
+              },
+              ...prev,
+            ])
+          }
+        } catch {
+          if (typeof event.data === 'string' && event.data.trim()) {
+            setSuccessMsg(event.data)
+          }
         }
-      } catch {
-        if (typeof event.data === 'string' && event.data.trim()) {
-          setSuccessMsg(event.data)
-        }
+      }
+
+      socket.onclose = (event) => {
+        if (disposed) return
+        if (event.code === 1008) return
+        const delayMs = Math.min(1000 * 2 ** attempt, 15000)
+        attempt += 1
+        reconnectTimer = window.setTimeout(connectSocket, delayMs)
       }
     }
 
+    connectSocket()
+
     return () => {
-      socket.close()
+      disposed = true
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer)
+      }
+      if (socket && socket.readyState <= WebSocket.OPEN) {
+        socket.close()
+      }
     }
-  }, [apiUrl, companyId])
+  }, [apiUrl])
 
   return (
     <div style={{ display: 'flex', height: '100vh', background: '#070b14', color: '#f8fafc', fontFamily: 'Inter, system-ui, sans-serif', overflow: 'hidden' }}>
@@ -220,7 +301,7 @@ export default function Dashboard({
                   </p>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    {notifications.map((n: any, idx: number) => (
+                    {notifications.map((n, idx) => (
                       <div
                         key={n.id ?? idx}
                         style={{

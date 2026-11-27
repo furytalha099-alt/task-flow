@@ -1,12 +1,52 @@
 import { useEffect, useState } from 'react'
 import { ProjectAIAskCard } from './ProjectAIAskCard'
 
-export default function ProjectsView({ projects, groups, tasks, userRole, currentUserId, apiUrl, getCsrfToken, refreshData, setSuccessMsg }: any) {
-  const [selectedProject, setSelectedProject] = useState<any | null>(null)
+interface ProjectItem {
+  id: number
+  name: string
+  description?: string | null
+  company_id: number
+  group_id?: number | null
+}
+
+interface GroupItem {
+  id: number
+  name: string
+}
+
+interface TaskItem {
+  id: number
+  title: string
+  status?: string
+  priority?: string
+  project_id?: number | null
+}
+
+interface TaskCommentItem {
+  id: number
+  content: string
+  user_id: number
+  author_email?: string
+}
+
+interface ProjectsViewProps {
+  projects: ProjectItem[]
+  groups: GroupItem[]
+  tasks: TaskItem[]
+  userRole: 'admin' | 'member'
+  currentUserId?: number | null
+  apiUrl: string
+  getCsrfToken: () => string
+  refreshData: () => void
+  setSuccessMsg: (msg: string | null) => void
+}
+
+export default function ProjectsView({ projects, groups, tasks, userRole, currentUserId, apiUrl, getCsrfToken, refreshData, setSuccessMsg }: ProjectsViewProps) {
+  const [selectedProject, setSelectedProject] = useState<ProjectItem | null>(null)
   const [showCommentBtn, setShowCommentBtn] = useState(false)
   const [showCommentBox, setShowCommentBox] = useState(false)
   const [commentTaskId, setCommentTaskId] = useState<number | ''>('')
-  const [taskComments, setTaskComments] = useState<any[]>([])
+  const [taskComments, setTaskComments] = useState<TaskCommentItem[]>([])
   const [commentText, setCommentText] = useState('')
   const [loadingComments, setLoadingComments] = useState(false)
   const [postingComment, setPostingComment] = useState(false)
@@ -34,8 +74,8 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.detail || 'Failed to load comments')
       setTaskComments(Array.isArray(data) ? data : [])
-    } catch (err: any) {
-      setCommentError(err.message || 'Failed to load comments')
+    } catch (err: unknown) {
+      setCommentError(err instanceof Error ? err.message : 'Failed to load comments')
       setTaskComments([])
     } finally {
       setLoadingComments(false)
@@ -64,8 +104,8 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
 
       setCommentText('')
       await loadTaskComments(Number(commentTaskId))
-    } catch (err: any) {
-      setCommentError(err.message || 'Failed to post comment')
+    } catch (err: unknown) {
+      setCommentError(err instanceof Error ? err.message : 'Failed to post comment')
     } finally {
       setPostingComment(false)
     }
@@ -108,8 +148,8 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
       setTargetGroupId('')
       setShowCreateModal(false)
       refreshData()
-    } catch (err: any) {
-      alert(err.message || 'Error creating project.')
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Error creating project.')
     }
   }
 
@@ -143,8 +183,8 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
       setSelectedProject(updatedProj)
       setShowEditModal(false)
       refreshData()
-    } catch (err: any) {
-      alert(err.message || 'Error updating project.')
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Error updating project.')
     }
   }
 
@@ -181,8 +221,8 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
 
   // --- PROJECT INSPECTOR (View Tasks inside a selected project) ---
   if (selectedProject) {
-    const projectTasks = tasks.filter((t: any) => Number(t.project_id) === Number(selectedProject.id))
-    const assignedGroup = groups.find((g: any) => g.id === selectedProject.group_id)
+    const projectTasks = tasks.filter((t) => Number(t.project_id) === Number(selectedProject.id))
+    const assignedGroup = groups.find((g) => g.id === selectedProject.group_id)
 
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: '24px' }}>
@@ -233,7 +273,7 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
                   const nextOpen = !showCommentBox
                   setShowCommentBox(nextOpen)
                   if (nextOpen && !commentTaskId) {
-                    const firstTask = tasks.find((t: any) => Number(t.project_id) === Number(selectedProject.id))
+                    const firstTask = tasks.find((t) => Number(t.project_id) === Number(selectedProject.id))
                     if (firstTask) setCommentTaskId(firstTask.id)
                   }
                 }}
@@ -270,7 +310,7 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
                       onChange={(e) => setCommentTaskId(e.target.value ? Number(e.target.value) : '')}
                       style={{ ...inputStyle, marginTop: 0, padding: '8px 12px', fontSize: '13px' }}
                     >
-                      {projectTasks.map((t: any) => (
+                      {projectTasks.map((t) => (
                         <option key={t.id} value={t.id}>
                           {t.title} (#{t.id})
                         </option>
@@ -288,7 +328,7 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
                     ) : taskComments.length === 0 ? (
                       <p style={{ fontSize: '12px', color: '#64748b' }}>No comments yet. Ask anything below.</p>
                     ) : (
-                      taskComments.map((c: any) => (
+                      taskComments.map((c) => (
                         <div key={c.id} style={{ background: '#0c1322', border: '1px solid #1e293b', borderRadius: '8px', padding: '10px' }}>
                           <div style={{ fontSize: '11px', fontWeight: 700, color: '#38bdf8' }}>
                             {c.author_email || `User #${c.user_id}`}
@@ -330,7 +370,7 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
                 No tasks created for this project yet. Go to the Task Operations tab to assign tasks here.
               </div>
             ) : (
-              projectTasks.map((task: any) => (
+              projectTasks.map((task) => (
                 <div key={task.id} style={{ background: '#0c1322', border: '1px solid #1e293b', borderRadius: '14px', padding: '18px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <div>
                     <div style={{ fontSize: '15px', fontWeight: 700, color: '#f8fafc', marginBottom: '4px' }}>{task.title}</div>
@@ -363,7 +403,7 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
                   <label style={{ fontSize: '11px', fontWeight: 700, color: '#64748b' }}>ASSIGN TO DEPARTMENT GROUP</label>
                   <select value={editTargetGroupId} onChange={(e) => setEditTargetGroupId(e.target.value)} style={inputStyle}>
                     <option value="">-- None / Independent Project --</option>
-                    {groups.map((g: any) => (
+                    {groups.map((g) => (
                       <option key={g.id} value={g.id}>{g.name}</option>
                     ))}
                   </select>
@@ -407,14 +447,14 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
             No projects found in the database. Create your first project above!
           </div>
         ) : (
-          projects.map((proj: any) => {
-            const assignedGroup = groups.find((g: any) => g.id === proj.group_id)
-            const projTasks = tasks.filter((t: any) => Number(t.project_id) === Number(proj.id))
+          projects.map((proj) => {
+            const assignedGroup = groups.find((g) => g.id === proj.group_id)
+            const projTasks = tasks.filter((t) => Number(t.project_id) === Number(proj.id))
             return (
               <div 
                 key={proj.id} 
                 onClick={() => {
-                  const firstTask = tasks.find((t: any) => Number(t.project_id) === Number(proj.id))
+                  const firstTask = tasks.find((t) => Number(t.project_id) === Number(proj.id))
                   setSelectedProject(proj)
                   setShowCommentBtn(true)
                   setShowCommentBox(false)
@@ -474,7 +514,7 @@ export default function ProjectsView({ projects, groups, tasks, userRole, curren
                 <label style={{ fontSize: '11px', fontWeight: 700, color: '#64748b' }}>ASSIGN TO DEPARTMENT GROUP</label>
                 <select value={targetGroupId} onChange={(e) => setTargetGroupId(e.target.value)} style={inputStyle}>
                   <option value="">-- None / Independent Project --</option>
-                  {groups.map((g: any) => (
+                  {groups.map((g) => (
                     <option key={g.id} value={g.id}>{g.name}</option>
                   ))}
                 </select>

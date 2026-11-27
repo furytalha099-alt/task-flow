@@ -753,5 +753,5 @@ def test_google_auth_and_websocket_notifications(client, monkeypatch):
     assert me_res.status_code == 200, me_res.text
     assert me_res.json()["id"] == company_id
 
-    with client.websocket_connect(f"/ws/notifications/{company_id}") as ws:
-        ws.send_text("ping")    
+    with client.websocket_connect("/ws/notifications") as ws:
+        ws.send_text("ping")
