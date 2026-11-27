@@ -1123,39 +1123,80 @@ def delete_company_user(
 @app.put("/tasks/{task_id}", response_model=TaskResponse)
 def edit_task(task_id: int, data: TaskUpdate, principal=Depends(require_company_admin), db: Session = Depends(get_db)) -> Task:
     payload, company = principal
+    updates = data.model_dump(exclude_unset=True)
     task = db.query(Task).filter(Task.id == task_id, Task.company_id == payload["company_id"]).first()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found.")
-    before = {"title": task.title, "description": task.description, "status": task.status,
-              "priority": task.priority, "due_at": task.due_at.isoformat() if task.due_at else None,
-              "project_id": task.project_id, "assigned_to_id": task.assigned_to_id}
-    if data.project_id is not None and db.query(Project).filter(
-        Project.id == data.project_id,
-        Project.company_id == payload["company_id"],
-    ).first() is None:
-        raise HTTPException(status_code=400, detail="Project not found in your company.")
-    if data.assigned_to_id is not None:
+    before = {
+        "title": task.title,
+        "description": task.description,
+        "status": task.status,
+        "priority": task.priority,
+        "due_at": task.due_at.isoformat() if task.due_at else None,
+        "project_id": task.project_id,
+        "assigned_to_id": task.assigned_to_id,
+    }
+    if "project_id" in updates and updates["project_id"] is not None:
+        project = db.query(Project).filter(
+            Project.id == updates["project_id"],
+            Project.company_id == payload["company_id"],
+        ).first()
+        if project is None:
+            raise HTTPException(status_code=400, detail="Project not found in your company.")
+    if "assigned_to_id" in updates and updates["assigned_to_id"] is not None:
         assignee = db.query(User).filter(
-            User.id == data.assigned_to_id,
+            User.id == updates["assigned_to_id"],
             User.company_id == payload["company_id"],
             User.is_active.is_(True),
         ).first()
         if assignee is None:
             raise HTTPException(status_code=400, detail="Assigned user is not active in this company.")
-    task.title = data.title.strip()
-    task.description = data.description
-    task.status = data.status.value
-    task.priority = data.priority.value
-    task.due_at = data.due_at
-    task.project_id = data.project_id
-    task.assigned_to_id = data.assigned_to_id
-    audit_event(db, company_id=company.id, actor_type="company_admin", actor_id=company.id,
-                action="task.update", target_type="task", target_id=task.id,
-                details={"before": before, "after": {
-                    "title": task.title, "description": task.description, "status": task.status,
-                    "priority": task.priority, "due_at": task.due_at.isoformat() if task.due_at else None,
-                    "project_id": task.project_id, "assigned_to_id": task.assigned_to_id,
-                }})
+
+    if "title" in updates:
+        if updates["title"] is None:
+            raise HTTPException(status_code=422, detail="title cannot be null.")
+        cleaned_title = updates["title"].strip()
+        if not cleaned_title:
+            raise HTTPException(status_code=422, detail="title cannot be blank.")
+        task.title = cleaned_title
+    if "description" in updates:
+        task.description = updates["description"].strip() if updates["description"] else None
+    if "status" in updates:
+        if updates["status"] is None:
+            raise HTTPException(status_code=422, detail="status cannot be null.")
+        task.status = data.status.value if isinstance(data.status, TaskStatus) else str(updates["status"])
+    if "priority" in updates:
+        if updates["priority"] is None:
+            raise HTTPException(status_code=422, detail="priority cannot be null.")
+        task.priority = data.priority.value if isinstance(data.priority, TaskPriority) else str(updates["priority"])
+    if "due_at" in updates:
+        task.due_at = updates["due_at"]
+    if "project_id" in updates:
+        task.project_id = updates["project_id"]
+    if "assigned_to_id" in updates:
+        task.assigned_to_id = updates["assigned_to_id"]
+
+    audit_event(
+        db,
+        company_id=company.id,
+        actor_type="company_admin",
+        actor_id=company.id,
+        action="task.update",
+        target_type="task",
+        target_id=task.id,
+        details={
+            "before": before,
+            "after": {
+                "title": task.title,
+                "description": task.description,
+                "status": task.status,
+                "priority": task.priority,
+                "due_at": task.due_at.isoformat() if task.due_at else None,
+                "project_id": task.project_id,
+                "assigned_to_id": task.assigned_to_id,
+            },
+        },
+    )
     db.commit()
     db.refresh(task)
     return task
@@ -1734,13 +1775,68 @@ def google_auth_login(data: GoogleAuthRequest, request: Request, response: Respo
     raise HTTPException(status_code=404, detail="No company account associated with this Google email.")
 
 
-@app.websocket("/ws/notifications/{company_id}")
-async def websocket_endpoint(websocket: WebSocket, company_id: int):
+def _authenticate_websocket_company(websocket: WebSocket, db: Session) -> int | None:
+    access_token = websocket.cookies.get(ACCESS_COOKIE)
+    if not access_token:
+        return None
+    try:
+        payload = decode_token(access_token)
+    except HTTPException:
+        return None
+
+    auth_session = db.get(AuthSession, payload["sid"])
+    if (
+        auth_session is None
+        or auth_session.revoked_at is not None
+        or datetime_is_expired(auth_session.expires_at)
+        or auth_session.company_id != payload["company_id"]
+    ):
+        return None
+
+    company = db.get(Company, payload["company_id"])
+    if company is None:
+        return None
+
+    principal_type = payload.get("principal_type")
+    if principal_type == "company_admin":
+        if (
+            auth_session.principal_type != "company_admin"
+            or auth_session.principal_id != company.id
+            or payload.get("role") != UserRole.admin.value
+            or str(company.id) != payload["sub"]
+        ):
+            return None
+        return company.id
+
+    if principal_type == "user":
+        try:
+            user_id = int(payload["sub"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if auth_session.principal_id != user_id:
+            return None
+        user = db.query(User).filter(
+            User.id == user_id,
+            User.company_id == company.id,
+        ).first()
+        if user is None or not user.is_active or user.role != payload.get("role"):
+            return None
+        return company.id
+
+    return None
+
+
+@app.websocket("/ws/notifications")
+async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
+    company_id = _authenticate_websocket_company(websocket, db)
+    if company_id is None:
+        await websocket.close(code=1008)
+        return
+
     await manager.connect(company_id, websocket)
     try:
         while True:
-            # Keep connection alive and listen for any client pings
-            data = await websocket.receive_text()
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(company_id, websocket)
 

@@ -1,7 +1,39 @@
 import { useState } from 'react'
 import { TaskAISummaryCard } from './TaskAISummaryCard'
 
-export default function TasksView({ tasks, users, projects, userRole, currentUserId, apiUrl, getCsrfToken, refreshData, setSuccessMsg }: any) {
+interface TaskRecord {
+  id: number
+  title: string
+  description?: string | null
+  status?: string
+  priority?: string
+  assigned_to_id?: number | null
+  project_id?: number | null
+}
+
+interface UserRecord {
+  id: number
+  email: string
+}
+
+interface ProjectRecord {
+  id: number
+  name: string
+}
+
+interface TasksViewProps {
+  tasks: TaskRecord[]
+  users: UserRecord[]
+  projects: ProjectRecord[]
+  userRole: 'admin' | 'member'
+  currentUserId?: number | null
+  apiUrl: string
+  getCsrfToken: () => string
+  refreshData: () => void
+  setSuccessMsg: (msg: string | null) => void
+}
+
+export default function TasksView({ tasks, users, projects, userRole, currentUserId, apiUrl, getCsrfToken, refreshData, setSuccessMsg }: TasksViewProps) {
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [taskTitle, setTaskTitle] = useState('')
   const [taskDesc, setTaskDesc] = useState('')
@@ -10,7 +42,7 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
   const [projectId, setProjectId] = useState<string>('')
 
   // State for editing an existing task
-  const [editingTask, setEditingTask] = useState<any | null>(null)
+  const [editingTask, setEditingTask] = useState<TaskRecord | null>(null)
   const [editTaskTitle, setEditTaskTitle] = useState('')
   const [editTaskDesc, setEditTaskDesc] = useState('')
   const [editTaskPriority, setEditTaskPriority] = useState('normal')
@@ -52,8 +84,8 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
       setProjectId('')
       setShowCreateModal(false)
       refreshData()
-    } catch (err: any) {
-      alert(err.message || 'Error creating task.')
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Error updating task.')
     }
   }
 
@@ -93,7 +125,7 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
     }
   }
 
-  function openEditModal(task: any) {
+  function openEditModal(task: TaskRecord) {
     setEditingTask(task)
     setEditTaskTitle(task.title || '')
     setEditTaskDesc(task.description || '')
@@ -122,8 +154,8 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
 
     setSuccessMsg(`Task status updated to ${newStatus}.`)
     refreshData()
-  } catch (err: any) {
-    alert(err.message || 'Error updating task status.')
+  } catch (err: unknown) {
+    alert(err instanceof Error ? err.message : 'Error updating task status.')
   }
 }
 
@@ -172,9 +204,9 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
             No tasks registered in the Neon database yet. Create your first task above!
           </div>
         ) : (
-          tasks.map((task: any) => {
-            const assignee = users.find((u: any) => u.id === task.assigned_to_id)
-            const associatedProject = projects.find((p: any) => p.id === task.project_id)
+          tasks.map((task) => {
+            const assignee = users.find((u) => u.id === task.assigned_to_id)
+            const associatedProject = projects.find((p) => p.id === task.project_id)
             
             return (
               <div 
@@ -258,7 +290,7 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
                 <label style={{ fontSize: '11px', fontWeight: 700, color: '#64748b' }}>ASSIGN TO PROJECT</label>
                 <select value={projectId} onChange={(e) => setProjectId(e.target.value)} style={inputStyle}>
                   <option value="">-- None / Independent Task --</option>
-                  {projects.map((p: any) => (
+                  {projects.map((p) => (
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
                 </select>
@@ -269,7 +301,7 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
                   <label style={{ fontSize: '11px', fontWeight: 700, color: '#64748b' }}>ASSIGN TO USER</label>
                   <select value={assignedUserId} onChange={(e) => setAssignedUserId(e.target.value)} style={inputStyle}>
                     <option value="">-- Unassigned --</option>
-                    {users.map((u: any) => (
+                    {users.map((u) => (
                       <option key={u.id} value={u.id}>{u.email}</option>
                     ))}
                   </select>
@@ -314,7 +346,7 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
                 <label style={{ fontSize: '11px', fontWeight: 700, color: '#64748b' }}>ASSIGN TO PROJECT</label>
                 <select value={editProjectId} onChange={(e) => setEditProjectId(e.target.value)} style={inputStyle}>
                   <option value="">-- None / Independent Task --</option>
-                  {projects.map((p: any) => (
+                  {projects.map((p) => (
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
                 </select>
@@ -325,7 +357,7 @@ export default function TasksView({ tasks, users, projects, userRole, currentUse
                   <label style={{ fontSize: '11px', fontWeight: 700, color: '#64748b' }}>ASSIGN TO USER</label>
                   <select value={editAssignedUserId} onChange={(e) => setEditAssignedUserId(e.target.value)} style={inputStyle}>
                     <option value="">-- Unassigned --</option>
-                    {users.map((u: any) => (
+                   {users.map((u) => (
                       <option key={u.id} value={u.id}>{u.email}</option>
                     ))}
                   </select>

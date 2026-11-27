@@ -56,6 +56,11 @@ class UserSummary(BaseModel):
     email: str
     role: str
     is_active: bool
+class UserRegister(BaseModel):
+    email: GmailEmail
+    password: Password
+
+
 class UserCreate(BaseModel):
     email: GmailEmail
     password: Password
@@ -95,6 +100,12 @@ class TaskUpdate(BaseModel):
     project_id: int | None = Field(default=None, gt=0)
     assigned_to_id: int | None = Field(default=None, gt=0)
 
+    @model_validator(mode="after")
+    def reject_null_required_fields(self):
+        for field_name in ("title", "status", "priority"):
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} cannot be null.")
+        return self
 class TaskStatusUpdate(BaseModel):
     status: TaskStatus
 
@@ -196,9 +207,9 @@ class GroupResponse(BaseModel):
 
     id: int
     name: str
-    description: Optional[str] = None
+    description: str | None = None
     company_id: int
-    users: list[UserSummary] = []  # <--- Change 'members' to 'users'
+    users: list[UserSummary] = Field(default_factory=list)
 
 class GoogleAuthRequest(BaseModel):
     credential: str    
